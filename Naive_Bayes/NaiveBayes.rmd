@@ -1,0 +1,284 @@
+---
+title: "Naive Bayes Project"
+author: "Matthew Lueder"
+date: "February 9, 2017"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load Packages
+```{r imports, results="hide"}
+require('Rcpp')
+require('inline')
+require('microbenchmark')
+require('caret')
+```
+
+### Read in training data
+Training data will be loaded into a list, with each element being a list of words for that training example.
+The first word for each line of input data is the label. This is removed and stared in the lbls vector.
+A vector containing each class is created (classes).
+```{r read_training}
+# Set working directory to project folder
+setwd("C:/Users/Matthew/Dropbox/Machine Learning/Projects/Project2")
+
+training = scan("T_S.data", what = character(), fill = T, sep = '\n')
+training = lapply(training, strsplit, split ="[ ]")
+lbls = unlist(lapply(training, function(l) unlist(l)[1]))
+classes = unique(lbls)
+training = lapply(training, function(l) unlist(l)[-1])    # Remove first element (the label)
+```
+
+### Build Vocabulary 
+The vocabulary is the set of words which have appeared at least once in the training data
+```{r vocab}
+vocab = unique(unlist(training))
+```
+
+### Calculate P(Class) for each class
+We create a vector of the probabilities of seeing each class based on the frequency of appearance of that class in the training data.
+$$P(Class_i) = \frac{Num.\ of\ training\ examples\ of\ in\ class\ i}{Total\ number\ of\ training\ examples}$$
+```{r class_prob}
+P.Class = sapply(classes, function(class) length(lbls[lbls==class])) / length(lbls)
+```
+
+### Combine training examples of same class
+Create a list with one index for each class and assign each index all words contained in all training examples of the respective class
+```{r create_texts}
+Texts = sapply(classes, function(class) unlist(training[lbls == class]))
+```
+
+### Count words for each class
+1) Create an empty matrix for counting the words of each class
+2) Create a C++ function to words quickly
+3) Apply the C++ function
+A C++ function was used because counting words with an R loop took an extraordinary amount of time. 
+We compare the performance of this C++ function to R in the next code chunk.
+```{r count_words}
+# 1)
+counts = vector(mode = "integer", length = length(vocab))
+names(counts) = vocab
+counts = t(sapply(classes, function(class) counts))
+
+# 2)
+funcSrc <- '
+#include <map>
+
+IntegerMatrix counts(counts_in);
+CharacterVector classes(classes_in);
+CharacterVector vocab(vocab_in);
+List texts(texts_in);
+
+// Create map to look up position of words/class indices
+std::map<std::string, int> wordIndex;
+std::map<std::string, int> classIndex;
+for (int i=0; i != vocab.size(); ++i)
+{
+  wordIndex[as<std::string>(vocab[i])] = i;
+}
+for (int i=0; i != classes.size(); ++i)
+{
+  classIndex[as<std::string>(classes[i])] = i;
+}
+
+// Count words
+for (int i=0; i != classes.size(); ++i)
+{
+  CharacterVector text = Rcpp::as<CharacterVector>(texts[as<std::string>(classes[i])]);
+  
+  for (int j=0; j != text.size(); ++j)
+  {
+    counts( classIndex[as<std::string>(classes[i])], wordIndex[as<std::string>(text[j])] )++;
+  }
+}
+return counts;
+'
+count.words <- cxxfunction(sig = signature(counts_in="integer", classes_in="character", texts_in="list", vocab_in="character"), funcSrc, plugin = "Rcpp")
+
+# 3)
+counts = count.words(counts, classes, Texts, vocab)
+
+rm(funcSrc)
+```
+
+### Compare performance of C++ and R
+Shows why C++ was nessesary, and how much it improved performace.
+First I reduce the dataset to 1/1000th of the size to allow R function to complete in reasonable time
+```{r benchmark}
+Texts.short = lapply(Texts, function(words) words[0:as.integer(length(words)/1000)])
+
+count.words.inR <- function(counts, classes, Texts) {
+   for(class in classes)
+   {
+     for(word in unlist(Texts[class]))
+     {
+       counts[class, word] = counts[class, word] + 1
+     }
+   }
+}
+
+microbenchmark( count.words(counts, classes, Texts.short, vocab),
+                count.words.inR(counts, classes, Texts.short),
+                times = 10 )
+
+rm(count.words.inR, Texts.short)
+```
+
+### Calculate word probabilities for each class
+$$P(Word_k | Class_i) = (n_k + 1) / (n + |Vocabulary|)$$
+n = total number of word positions in class i
+n_k = number of times Word k occurs in class
+```{r word_prob}
+n = apply(counts, 1, sum)
+n.v = n + length(vocab)   # = n + |Vocabulary|
+P.words = (counts + 1) / n.v
+Log.P.words = log(P.words)
+
+rm(n, n.v, P.words)
+```
+
+### Read in validation data
+```{r read_validation}
+validation = scan("V_S.data", what = character(), fill = T, sep = '\n')
+validation = lapply(validation, strsplit, split ="[ ]")
+v.lbls = unlist(lapply(validation, function(l) unlist(l)[1]))
+validation = lapply(validation, function(l) unlist(l)[-1])  # Remove first element (the label)
+
+# Remove words not in vocabulary 
+validation = lapply(validation, function(input) input[unlist(input) %in% vocab])
+```
+
+### Perform classification
+```{r classify}
+classify <- function(example) {
+  which.max(rowSums(cbind(Log.P.words[,unlist(example)], log(P.Class))))
+}
+
+PredictedClasses = factor(names(sapply(validation, classify)))
+```
+
+### Collect metrics / Visualize results
+```{r return_results}
+confusionMatrix(PredictedClasses, factor(v.lbls))
+```
+
+Overall accuracy = 81.04%
+Let's see if we can do better.
+
+### Eliminate words which have a probability with a standard deviation lower than a certain amount
+```{r SD_eliminate}
+Log.P.words.store = Log.P.words
+accuracy = c()
+
+for (sdp in seq(.1,.9,.1))
+{
+  Log.P.words = Log.P.words.store 
+  sdForEachWord = apply(exp(Log.P.words), 2, sd)
+  wordsToElim = which(sdForEachWord < quantile(sdForEachWord, sdp))
+  Log.P.words = Log.P.words[,-wordsToElim]
+  vs.vocab = vocab[-wordsToElim]
+  vs.validation = lapply(validation, function(input) input[unlist(input) %in% vs.vocab])
+  PredictedClasses = factor(names(sapply(vs.validation, classify)))
+  accuracy = c( accuracy, confusionMatrix(PredictedClasses, factor(v.lbls))$overall["Accuracy"])
+}
+
+rm(sdp, sdForEachWord, wordsToElim, vs.validation, vs.vocab)
+```
+
+### See if we did any better
+```{r plot_sd}
+accuracy
+plot(seq(10,90,10), accuracy, xlab = "Percent of Words Removed Based on Standard Deviation")
+```
+
+Removing features based on standard deviation hurts the performance of the classifier after removing more than 20% of the words. Removing 10% helped the performance of the classifier but only an extremely small, insignificant amount.
+
+The classes seemed to be related, ex. Christianity, atheism, religion.
+Maybe it makes sense to group together certain classes.
+Let's see what hierarchical clustering tells us.
+
+### Perform hierarchical clustering
+```{r cluster}
+clusters = hclust(dist(Log.P.words, method = "manhattan"))
+plot(clusters)
+Log.P.words = Log.P.words.store 
+ ```
+
+Looking at the results we see that a lot of our clusters make sense. We can use these results to guide us in how we group classes. 
+Christianity, atheism, and religion are closely clustered so we will group them into a single class, religion.
+xwindows, graphics, mswindows, pc, and mac are closely clustered, so we will group them into a computing class.
+Cryptology, medicine and space are clustered together, so we will group them into a class named science. 
+Baseball and hockey are clustered together, we will group them in a class named sports.
+Autos and motorcycles are clustered together, so we will group them in a class called vehicles.
+
+### Restructure training data
+```{r restructure_t}
+reclassify <- function(class) {
+  if (class %in% c("atheism", "christianity")) {
+    return("religion")
+  }
+  if (class %in% c("xwindows", "graphics", "mswindows", "pc", "mac")) {
+    return("computing")
+  }
+  if (class %in% c("cryptology", "medicine", "space")) {
+    return("science")
+  }
+  if (class %in% c("baseball", "hockey")) {
+    return("sports")
+  }
+  if (class %in% c("autos", "motorcycles")) {
+    return("vehicles")
+  }
+  return(class)
+}
+
+lbls = sapply(lbls, reclassify) 
+classes = unique(lbls)
+
+P.Class = sapply(classes, function(class) length(lbls[lbls==class])) / length(lbls)
+Texts = sapply(classes, function(class) unlist(training[lbls == class]))
+
+counts = vector(mode = "integer", length = length(vocab))
+names(counts) = vocab
+counts = t(sapply(classes, function(class) counts))
+counts = count.words(counts, classes, Texts, vocab)
+
+n = apply(counts, 1, sum)
+n.v = n + length(vocab)   # = n + |Vocabulary|
+P.words = (counts + 1) / n.v
+Log.P.words = log(P.words)
+rm(n, n.v, P.words)
+```
+
+### Restructure validation data
+```{r restructure_v}
+v.lbls = sapply(v.lbls, reclassify) 
+```
+
+### Perform classification with restructured data
+And print results.
+```{r classify_restructured}
+PredictedClasses = factor(names(sapply(validation, classify)))
+confusionMatrix(PredictedClasses, factor(v.lbls))
+```
+
+Overall accuracy = 0.8699, an improvement. Forsale and electronics were difficult to classify. 
+
+It is suggested in literature to remove class prior probabilities when classifying text documents.
+Let's see what happens when we do this.
+
+### Perform classification again, but drop P(Class) from the final equation
+```{r classify3}
+zeros = rep(0, length(classes))
+classify2 <- function(example) {
+  which.max(rowSums(cbind(Log.P.words[,unlist(example)], zeros)))
+}
+
+PredictedClasses = factor(names(sapply(validation, classify2)))
+confusionMatrix(PredictedClasses, factor(v.lbls))
+```
+
+Overall accuracy = 0.8727, a slight improvement.
